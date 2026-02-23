@@ -36,12 +36,12 @@ async function initializeCircuit(): Promise<{ noir: Noir; backend: BarretenbergB
     console.log('[zkProofService] Circuit loaded successfully');
 
     // Initialize Noir instance
-    cachedNoir = new Noir(cachedCircuit);
+    cachedNoir = new Noir(cachedCircuit as any);
     console.log('[zkProofService] Noir instance created');
 
     // Initialize Barretenberg backend with proper WASM path configuration
     // The backend will automatically download WASM files from unpkg CDN
-    cachedBackend = new BarretenbergBackend(cachedCircuit, {
+    cachedBackend = new BarretenbergBackend(cachedCircuit!, {
       // Let Barretenberg use its default CDN for WASM files
       threads: 1, // Use single thread for compatibility
     });
@@ -130,9 +130,7 @@ export async function verifyTacticProof(
 
     const isValid = await backend.verifyProof({
       proof,
-      publicInputs: {
-        session_id: publicInputs.session_id.toString(),
-      },
+      publicInputs: [publicInputs.session_id.toString()],
     });
 
     console.log('[zkProofService] Proof verification result:', isValid);

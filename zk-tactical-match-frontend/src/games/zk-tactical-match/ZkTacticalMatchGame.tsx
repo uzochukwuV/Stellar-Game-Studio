@@ -13,6 +13,7 @@ interface Props {
   availablePoints: bigint;
   onStandingsRefresh: () => void;
   onGameComplete: () => void;
+  currentEpoch: number
 }
 
 const TACTICS = [
@@ -22,7 +23,7 @@ const TACTICS = [
   { id: 3, name: 'All-Out', icon: '🔥', gradient: 'from-purple-400 via-pink-500 to-rose-500', glow: 'shadow-purple-500/50' },
 ];
 
-export function ZkTacticalMatchGame({ userAddress, availablePoints, onStandingsRefresh, onGameComplete }: Props) {
+export function ZkTacticalMatchGame({ userAddress, availablePoints, onStandingsRefresh, onGameComplete, currentEpoch }: Props) {
   const { getContractSigner } = useWallet();
   const [phase, setPhase] = useState<'lobby' | 'waiting' | 'join' | 'ready' | 'waitingForP2' | 'waitingForP1' | 'tactics' | 'waitingForOpponent' | 'results'>('lobby');
   const [sessionId, setSessionId] = useState(() => Math.floor(Math.random() * 0xffffffff) || 1);
@@ -606,7 +607,7 @@ export function ZkTacticalMatchGame({ userAddress, availablePoints, onStandingsR
         </div>
       )}
 
-      <style jsx>{`
+      <style>{`
         @keyframes gradient {
           0%, 100% { background-position: 0% 50%; }
           50% { background-position: 100% 50%; }
