@@ -8,9 +8,11 @@ export interface Match {
   player2: string | null;
   player1Points: bigint;
   player2Points: bigint | null;
-  status: 'waiting' | 'ready' | 'playing' | 'complete';
+  status: 'waiting' | 'ready' | 'signed' | 'playing' | 'complete';
   player1Tactic: number | null;
   player2Tactic: number | null;
+  player2AuthEntryXDR: string | null; // Player 2 signs first in reverse multi-sig flow
+  fullySignedTxXDR: string | null;
   createdAt: number;
 }
 
@@ -36,7 +38,7 @@ class MatchmakingService {
   createMatch(player1: string, sessionId: number, points: bigint): Match {
     const matches = this.getMatches();
     const match: Match = {
-      id: `match_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+      id: `match_${Date.now()}_${Math.random().toString(36).substring(2, 11)}`,
       sessionId,
       player1,
       player2: null,
@@ -45,6 +47,8 @@ class MatchmakingService {
       status: 'waiting',
       player1Tactic: null,
       player2Tactic: null,
+      player2AuthEntryXDR: null,
+      fullySignedTxXDR: null,
       createdAt: Date.now(),
     };
     matches.push(match);
@@ -101,6 +105,35 @@ class MatchmakingService {
       }
     }, 2000);
     return () => clearInterval(interval);
+  }
+
+  storeAuthEntry(matchId: string, authEntryXDR: string) {
+    const matches = this.getMatches();
+    const match = matches.find(m => m.id === matchId);
+    if (match) {
+      match.player2AuthEntryXDR = authEntryXDR;
+      this.saveMatches(matches);
+    }
+  }
+
+  getAuthEntry(matchId: string): string | null {
+    const match = this.getMatch(matchId);
+    return match?.player2AuthEntryXDR || null;
+  }
+
+  storeFullySignedTx(matchId: string, fullySignedTxXDR: string) {
+    const matches = this.getMatches();
+    const match = matches.find(m => m.id === matchId);
+    if (match) {
+      match.fullySignedTxXDR = fullySignedTxXDR;
+      match.status = 'signed';
+      this.saveMatches(matches);
+    }
+  }
+
+  getFullySignedTx(matchId: string): string | null {
+    const match = this.getMatch(matchId);
+    return match?.fullySignedTxXDR || null;
   }
 }
 

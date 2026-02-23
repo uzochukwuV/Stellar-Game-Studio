@@ -218,8 +218,71 @@ impl ZkTacticalMatchContract {
         Ok(())
     }
 
+    /// Verify a ZK proof for tactical choice submission
+    ///
+    /// **Verification steps:**
+    /// 1. Basic proof validation (length, format)
+    /// 2. Tactic range check (must be 0-3)
+    /// 3. Protocol 25 verification (when available)
+    ///
+    /// # Arguments
+    /// * `env` - Environment
+    /// * `proof` - ZK proof bytes from Noir circuit
+    /// * `tactic` - The claimed tactic (public input)
+    /// * `session_id` - The session ID (public input)
+    ///
+    /// # Returns
+    /// * `Ok(())` if proof is valid
+    /// * `Err(Error::InvalidProof)` if proof is invalid
+    fn verify_zk_proof(
+        _env: &Env,
+        proof: &Bytes,
+        tactic: u32,
+        _session_id: u32,
+    ) -> Result<(), Error> {
+        // Basic validation: proof should not be empty
+        if proof.len() == 0 {
+            return Err(Error::InvalidProof);
+        }
+
+        // Tactic range check (redundant with submit_tactic, but good for defense in depth)
+        if tactic > 3 {
+            return Err(Error::InvalidTactic);
+        }
+
+        // TODO: Full ZK verification using Stellar Protocol 25 (X-Ray) primitives
+        // Once Protocol 25 is available on testnet, use:
+        // - env.crypto().verify_noir_proof(proof, public_inputs)
+        // - Or env.crypto().verify_bn254_proof(proof, vk, public_inputs)
+        //
+        // For now, we validate proof format and rely on client-side generation
+        // This is acceptable for hackathon/demo, but NOT for production
+
+        // Validate proof minimum length (Barretenberg proofs are typically > 100 bytes)
+        if proof.len() < 32 {
+            return Err(Error::InvalidProof);
+        }
+
+        // Additional validation: check that proof is not all zeros
+        let mut all_zeros = true;
+        for i in 0..proof.len() {
+            if proof.get(i).unwrap_or(0) != 0 {
+                all_zeros = false;
+                break;
+            }
+        }
+
+        if all_zeros {
+            return Err(Error::InvalidProof);
+        }
+
+        // Proof passed basic validation
+        // In production, this would include full cryptographic verification
+        Ok(())
+    }
+
     /// Submit tactical choice with ZK proof.
-    /// 
+    ///
     /// **ZK Proof validates:**
     /// - tactic ∈ [0-3]
     /// - player identity
@@ -243,9 +306,10 @@ impl ZkTacticalMatchContract {
             return Err(Error::InvalidTactic);
         }
 
-        // TODO: Verify ZK proof using Stellar Protocol 25 primitives
-        // For hackathon MVP: Hash-based validation
-        // Production: Use env.crypto() BN254/Poseidon verification
+        // Verify ZK proof
+        Self::verify_zk_proof(&env, &proof, tactic, session_id)?;
+
+        // Store proof hash for commitment tracking
         let proof_hash = env.crypto().keccak256(&proof).into();
 
         let key = DataKey::Game(session_id);

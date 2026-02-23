@@ -18,6 +18,7 @@ export default defineConfig({
   },
   optimizeDeps: {
     include: ['@stellar/stellar-sdk', '@stellar/stellar-sdk/contract', '@stellar/stellar-sdk/rpc', 'buffer'],
+    exclude: ['@aztec/bb.js'],
     esbuildOptions: {
       define: {
         global: 'globalThis'
@@ -27,10 +28,16 @@ export default defineConfig({
   build: {
     commonjsOptions: {
       transformMixedEsModules: true
-    }
+    },
+    target: 'esnext'
   },
   server: {
     port: 3000,
-    open: true
+    open: true,
+    headers: {
+      // Enable SharedArrayBuffer for WASM threading
+      'Cross-Origin-Opener-Policy': 'same-origin',
+      'Cross-Origin-Embedder-Policy': 'require-corp'
+    }
   }
 })

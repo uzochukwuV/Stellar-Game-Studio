@@ -4,6 +4,7 @@ import { useWallet } from '@/hooks/useWallet';
 import { ZK_TACTICAL_MATCH_CONTRACT } from '@/utils/constants';
 import { matchmakingService, type Match } from './matchmakingService';
 import type { Game } from './bindings';
+import { generateTacticProof, generatePlayerSecret } from './zkProofService';
 
 const zkTacticalMatchService = new ZkTacticalMatchService(ZK_TACTICAL_MATCH_CONTRACT);
 
@@ -23,8 +24,8 @@ const TACTICS = [
 
 export function ZkTacticalMatchGame({ userAddress, availablePoints, onStandingsRefresh, onGameComplete }: Props) {
   const { getContractSigner } = useWallet();
-  const [phase, setPhase] = useState<'lobby' | 'waiting' | 'join' | 'ready' | 'tactics' | 'results'>('lobby');
-  const [sessionId] = useState(() => Math.floor(Math.random() * 0xffffffff) || 1);
+  const [phase, setPhase] = useState<'lobby' | 'waiting' | 'join' | 'ready' | 'waitingForP2' | 'waitingForP1' | 'tactics' | 'waitingForOpponent' | 'results'>('lobby');
+  const [sessionId, setSessionId] = useState(() => Math.floor(Math.random() * 0xffffffff) || 1);
   const [matchId, setMatchId] = useState<string | null>(null);
   const [currentMatch, setCurrentMatch] = useState<Match | null>(null);
   const [joinCode, setJoinCode] = useState('');
@@ -34,19 +35,32 @@ export function ZkTacticalMatchGame({ userAddress, availablePoints, onStandingsR
   const [error, setError] = useState<string | null>(null);
   const [showTacticModal, setShowTacticModal] = useState(false);
 
+  // Get the actual session ID from current match (for Player 2) or use component state (for Player 1)
+  const activeSessionId = currentMatch?.sessionId ?? sessionId;
+
   const handleCreateMatch = async () => {
     const match = matchmakingService.createMatch(userAddress, sessionId, BigInt(1000000));
     setMatchId(match.id);
     setCurrentMatch(match);
     setPhase('waiting');
-    
-    // Poll for opponent
+
+    console.log('[Player 1] Match created, waiting for Player 2 to join');
+
+    // Poll for match updates
     const unwatch = matchmakingService.watchMatch(match.id, (updated) => {
-      if (updated?.status === 'ready') {
+      if (updated) {
         setCurrentMatch(updated);
-        setPhase('ready'); // Show start game button
+
+        // When Player 2 joins and signs their auth entry, transition to ready
+        if (updated.status === 'ready' && updated.player2 && updated.player2AuthEntryXDR) {
+          console.log('[Player 1] Player 2 has joined and signed auth entry');
+          setPhase('ready');
+        }
       }
     });
+
+    // Cleanup function would be called on unmount
+    return unwatch;
   };
 
   const handleJoinMatch = async () => {
@@ -54,68 +68,222 @@ export function ZkTacticalMatchGame({ userAddress, availablePoints, onStandingsR
       setError('Enter a match code');
       return;
     }
-    
+
     const matches = matchmakingService.getWaitingMatches();
     const match = matches.find(m => m.sessionId.toString() === joinCode);
-    
+
     if (!match) {
       setError('Match not found');
       return;
     }
-    
+
     const joined = matchmakingService.joinMatch(match.id, userAddress, BigInt(1000000));
-    if (joined) {
-      setMatchId(joined.id);
-      setCurrentMatch(joined);
-      setPhase('ready'); // Wait for player 1 to start
-    } else {
+    if (!joined) {
       setError('Failed to join match');
+      return;
+    }
+
+    setMatchId(joined.id);
+    setCurrentMatch(joined);
+
+    try {
+      setLoading(true);
+      setError(null);
+      const signer = getContractSigner();
+
+      console.log('[Player 2] Preparing to sign auth entry as Player 2');
+
+      // Player 2 creates and signs their auth entry
+      const player2AuthEntryXDR = await zkTacticalMatchService.prepareStartGameAsPlayer2(
+        joined.sessionId,
+        joined.player1,     // Player 1 address (match creator)
+        userAddress,        // Player 2 address (current user)
+        joined.player1Points,
+        BigInt(1000000),    // Player 2 points
+        signer              // Player 2's signer
+      );
+
+      console.log('[Player 2] Auth entry signed successfully, storing for Player 1');
+
+      // Store Player 2's signed auth entry for Player 1 to retrieve
+      matchmakingService.storeAuthEntry(joined.id, player2AuthEntryXDR);
+      setPhase('waitingForP1');
+
+      console.log('[Player 2] Starting to poll for game start...');
+
+      // Poll for Player 1 to complete the transaction and start the game
+      const unwatch = matchmakingService.watchMatch(joined.id, (updated) => {
+        if (updated) {
+          setCurrentMatch(updated);
+
+          // When game status changes to 'signed', Player 1 has completed the transaction
+          if (updated.status === 'signed') {
+            console.log('[Player 2] Game started by Player 1, transitioning to tactics phase');
+            setPhase('tactics');
+            onStandingsRefresh(); // Refresh to show locked points
+          }
+        }
+      });
+
+      // Cleanup function would be called on unmount
+      return unwatch;
+    } catch (err) {
+      console.error('[Player 2] Error creating auth entry:', err);
+      setError(err instanceof Error ? err.message : 'Failed to create auth entry');
+    } finally {
+      setLoading(false);
     }
   };
 
   const handleStartGame = async () => {
+    if (!currentMatch || !matchId) return;
+
     try {
       setLoading(true);
-      const current = currentMatch;
-      if (!current) return;
-      
+      setError(null);
       const signer = getContractSigner();
-      const mockProof = new Uint8Array([selectedTactic, ...Array(31).fill(0)]);
-      
-      await zkTacticalMatchService.startGame(
-        sessionId,
-        current.player1,
-        current.player2!,
-        current.player1Points,
-        current.player2Points!,
-        userAddress,
-        signer
+
+      console.log('[Player 1] Retrieving Player 2 auth entry from matchmaking service');
+
+      // Retrieve Player 2's signed auth entry from matchmaking service
+      const player2AuthEntryXDR = matchmakingService.getAuthEntry(matchId);
+
+      if (!player2AuthEntryXDR) {
+        throw new Error('Player 2 has not signed their auth entry yet. Please wait.');
+      }
+
+      console.log('[Player 1] Importing Player 2 auth entry and finalizing transaction');
+
+      // Player 1 imports Player 2's auth entry, signs own auth entry, and submits
+      await zkTacticalMatchService.importAndFinalizeAsPlayer1(
+        player2AuthEntryXDR,
+        currentMatch.sessionId,
+        userAddress,                    // Player 1 address (current user)
+        currentMatch.player2!,          // Player 2 address (from match)
+        currentMatch.player1Points,     // Player 1 points
+        currentMatch.player2Points!,    // Player 2 points
+        signer                          // Player 1's signer
       );
+
+      console.log('[Player 1] ✅ Game started successfully');
+
+      // Update matchmaking status
+      matchmakingService.storeFullySignedTx(matchId, 'completed');
+
+      // Transition to tactics phase
       setPhase('tactics');
+
+      // Refresh standings to show locked points
+      onStandingsRefresh();
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to start');
+      console.error('[Player 1] Error starting game:', err);
+      setError(err instanceof Error ? err.message : 'Failed to start game');
     } finally {
       setLoading(false);
     }
   };
 
   const copyMatchCode = () => {
-    navigator.clipboard.writeText(sessionId.toString());
+    navigator.clipboard.writeText(activeSessionId.toString());
   };
 
   const handleSubmitTactic = async () => {
-    if (selectedTactic === null) return;
-    
+    if (selectedTactic === null || !matchId) return;
+
     try {
       setLoading(true);
+      setError(null);
       const signer = getContractSigner();
-      const mockProof = new Uint8Array([selectedTactic, ...Array(31).fill(0)]);
-      
-      await zkTacticalMatchService.submitTactic(sessionId, userAddress, selectedTactic, mockProof, signer);
+
+      console.log(`[${userAddress === currentMatch?.player1 ? 'Player 1' : 'Player 2'}] Generating ZK proof for tactic:`, selectedTactic);
+
+      let proof: Uint8Array;
+
+      try {
+        // Generate player secret (should be stored securely in production)
+        const playerSecret = generatePlayerSecret();
+        console.log('[ZK] Player secret generated');
+
+        // Generate ZK proof
+        proof = await generateTacticProof(selectedTactic, playerSecret, activeSessionId);
+        console.log('[ZK] ✅ Proof generated successfully (', proof.length, 'bytes)');
+      } catch (zkError) {
+        console.warn('[ZK] Failed to generate ZK proof, using mock proof:', zkError);
+        console.warn('[ZK] This is acceptable for demo/testing but NOT for production');
+
+        // Fallback to mock proof (deterministic based on tactic and session)
+        const mockProofData = new Uint8Array(128);
+        // Fill with deterministic data based on tactic and sessionId
+        mockProofData[0] = selectedTactic;
+        for (let i = 1; i < 128; i++) {
+          mockProofData[i] = (selectedTactic * activeSessionId + i) % 256;
+        }
+        proof = mockProofData;
+        console.log('[ZK] Using mock proof (', proof.length, 'bytes)');
+      }
+
+      console.log(`[${userAddress === currentMatch?.player1 ? 'Player 1' : 'Player 2'}] Submitting tactic with proof`);
+
+      await zkTacticalMatchService.submitTactic(activeSessionId, userAddress, selectedTactic, proof, signer);
+
+      // Update matchmaking service
+      matchmakingService.submitTactic(matchId, userAddress, selectedTactic);
+
       setShowTacticModal(false);
-      setPhase('results');
+
+      console.log(`[${userAddress === currentMatch?.player1 ? 'Player 1' : 'Player 2'}] Tactic submitted, checking if both players are ready...`);
+
+      // Check if both players have submitted tactics
+      const updatedMatch = matchmakingService.getMatch(matchId);
+      if (updatedMatch?.player1Tactic !== null && updatedMatch?.player2Tactic !== null) {
+        console.log('Both players have submitted tactics, resolving match...');
+
+        // Both players submitted, resolve the match
+        await zkTacticalMatchService.resolveMatch(activeSessionId, userAddress, signer);
+
+        console.log('Match resolved, fetching game state...');
+
+        // Fetch final game state
+        const finalGameState = await zkTacticalMatchService.getGame(activeSessionId);
+        setGameState(finalGameState);
+        setPhase('results');
+
+        // Refresh standings to show updated points
+        onStandingsRefresh();
+      } else {
+        // Wait for other player
+        console.log('Waiting for other player to submit tactic...');
+        setPhase('waitingForOpponent');
+
+        // Poll for other player's tactic submission
+        const unwatch = matchmakingService.watchMatch(matchId, async (updated) => {
+          if (updated?.player1Tactic !== null && updated?.player2Tactic !== null) {
+            console.log('Other player submitted tactic, resolving match...');
+
+            try {
+              // Both players submitted, resolve the match
+              await zkTacticalMatchService.resolveMatch(activeSessionId, userAddress, signer);
+
+              // Fetch final game state
+              const finalGameState = await zkTacticalMatchService.getGame(activeSessionId);
+              setGameState(finalGameState);
+              setPhase('results');
+
+              // Refresh standings
+              onStandingsRefresh();
+            } catch (err) {
+              console.error('Error resolving match:', err);
+              setError(err instanceof Error ? err.message : 'Failed to resolve match');
+            }
+          }
+        });
+
+        // Store cleanup function
+        return unwatch;
+      }
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed');
+      console.error('Error submitting tactic:', err);
+      setError(err instanceof Error ? err.message : 'Failed to submit tactic');
     } finally {
       setLoading(false);
     }
@@ -250,13 +418,21 @@ export function ZkTacticalMatchGame({ userAddress, availablePoints, onStandingsR
               </div>
 
               {currentMatch.player1 === userAddress ? (
-                <button
-                  onClick={handleStartGame}
-                  disabled={loading}
-                  className="px-12 py-5 bg-gradient-to-r from-green-500 to-emerald-500 hover:from-green-600 hover:to-emerald-600 rounded-2xl font-bold text-xl text-white transition-all hover:scale-105 hover:shadow-2xl hover:shadow-green-500/50 disabled:opacity-50"
-                >
-                  {loading ? 'Starting...' : '🚀 Start Game'}
-                </button>
+                <>
+                  {currentMatch.player2AuthEntryXDR ? (
+                    <button
+                      onClick={handleStartGame}
+                      disabled={loading}
+                      className="px-12 py-5 bg-gradient-to-r from-green-500 to-emerald-500 hover:from-green-600 hover:to-emerald-600 rounded-2xl font-bold text-xl text-white transition-all hover:scale-105 hover:shadow-2xl hover:shadow-green-500/50 disabled:opacity-50"
+                    >
+                      {loading ? 'Starting...' : '🚀 Start Game'}
+                    </button>
+                  ) : (
+                    <div className="p-6 bg-gradient-to-r from-yellow-500/10 to-orange-500/10 rounded-2xl border border-yellow-500/20">
+                      <p className="text-yellow-200">⏳ Waiting for Player 2 to sign their auth entry...</p>
+                    </div>
+                  )}
+                </>
               ) : (
                 <div className="p-6 bg-gradient-to-r from-yellow-500/10 to-orange-500/10 rounded-2xl border border-yellow-500/20">
                   <p className="text-yellow-200">⏳ Waiting for Player 1 to start the game...</p>
@@ -266,7 +442,7 @@ export function ZkTacticalMatchGame({ userAddress, availablePoints, onStandingsR
           </div>
         )}
 
-        {/* Waiting Phase */}
+        {/* Waiting Phase - Player 1 waiting for Player 2 to join */}
         {phase === 'waiting' && (
           <div className="max-w-2xl mx-auto">
             <div className="bg-white/5 backdrop-blur-2xl rounded-3xl border border-white/10 p-12 text-center shadow-2xl">
@@ -276,15 +452,53 @@ export function ZkTacticalMatchGame({ userAddress, availablePoints, onStandingsR
               </div>
               <h2 className="text-4xl font-bold text-white mb-4">Waiting for Opponent</h2>
               <p className="text-purple-200/70 mb-8">Share your match code with a friend</p>
-              
+
               <div className="p-6 bg-gradient-to-r from-purple-500/10 to-pink-500/10 rounded-2xl border border-purple-500/20 mb-6">
                 <p className="text-sm text-purple-200/70 mb-2">Match Code</p>
-                <p className="text-3xl font-mono font-bold text-white">{sessionId}</p>
+                <p className="text-3xl font-mono font-bold text-white">{activeSessionId}</p>
               </div>
 
               <button onClick={copyMatchCode} className="px-8 py-4 bg-gradient-to-r from-purple-500 to-pink-500 hover:from-purple-600 hover:to-pink-600 rounded-xl font-bold text-white transition-all hover:scale-105 hover:shadow-xl hover:shadow-purple-500/50">
                 📋 Copy Match Code
               </button>
+            </div>
+          </div>
+        )}
+
+        {/* Waiting for P1 Phase - Player 2 waiting for Player 1 to start */}
+        {phase === 'waitingForP1' && (
+          <div className="max-w-2xl mx-auto">
+            <div className="bg-white/5 backdrop-blur-2xl rounded-3xl border border-white/10 p-12 text-center shadow-2xl">
+              <div className="relative inline-block mb-8">
+                <div className="text-8xl animate-pulse">✅</div>
+                <div className="absolute inset-0 bg-green-500/20 rounded-full blur-2xl animate-pulse" />
+              </div>
+              <h2 className="text-4xl font-bold text-white mb-4">Auth Entry Signed!</h2>
+              <p className="text-green-200/70 mb-8">Waiting for Player 1 to start the game...</p>
+
+              <div className="p-6 bg-gradient-to-r from-green-500/10 to-emerald-500/10 rounded-2xl border border-green-500/20">
+                <p className="text-sm text-green-200/70">Your transaction signature has been submitted.</p>
+                <p className="text-sm text-green-200/70 mt-2">Player 1 will complete the transaction and start the match.</p>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* Waiting for Opponent Phase - After submitting tactic */}
+        {phase === 'waitingForOpponent' && (
+          <div className="max-w-2xl mx-auto">
+            <div className="bg-white/5 backdrop-blur-2xl rounded-3xl border border-white/10 p-12 text-center shadow-2xl">
+              <div className="relative inline-block mb-8">
+                <div className="text-8xl animate-pulse">⏳</div>
+                <div className="absolute inset-0 bg-blue-500/20 rounded-full blur-2xl animate-pulse" />
+              </div>
+              <h2 className="text-4xl font-bold text-white mb-4">Tactic Submitted!</h2>
+              <p className="text-blue-200/70 mb-8">Waiting for opponent to submit their tactic...</p>
+
+              <div className="p-6 bg-gradient-to-r from-blue-500/10 to-cyan-500/10 rounded-2xl border border-blue-500/20">
+                <p className="text-sm text-blue-200/70">Your tactical choice has been locked in.</p>
+                <p className="text-sm text-blue-200/70 mt-2">The match will be resolved once both players have submitted.</p>
+              </div>
             </div>
           </div>
         )}
