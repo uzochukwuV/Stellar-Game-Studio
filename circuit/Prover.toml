@@ -1,0 +1,8 @@
+# ZK Tactical Match - Proof inputs
+
+# Private inputs (hidden)
+tactic = "2"
+player_secret = "123456789012345678901234567890"
+
+# Public inputs
+session_id = "1"
